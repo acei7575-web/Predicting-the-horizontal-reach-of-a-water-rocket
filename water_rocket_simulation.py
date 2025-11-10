@@ -264,22 +264,3 @@ def compute_range(parameters: RocketParameters) -> float:
 
     history = simulate_flight(parameters)
     return history["range"][0]
-
-
-if __name__ == "__main__":
-    example = RocketParameters(
-        dry_mass=0.15,
-        water_volume=0.0015,  # 1.5 L bottle filled to 1.5 L of water
-        bottle_volume=0.002,
-        nozzle_diameter=0.022,
-        discharge_coefficient=0.95,
-        drag_coefficient=0.35,
-        cross_sectional_area=0.00785,
-        initial_air_pressure=5.0 * P_ATM,
-        launch_angle_deg=45.0,
-    )
-
-    result = simulate_flight(example)
-    range_estimate = result["range"][0]
-    print(f"Predicted horizontal range: {range_estimate:.2f} m")
-    print(f"Flight time: {result['time'][-1]:.2f} s")
