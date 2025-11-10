@@ -443,9 +443,10 @@ if __name__ == "__main__":
     )
 
     # Launch scenario supplied by the build notes in the prompt.
+    nose_mass_g = 60.0
     scenario_parameters = build_parameters_from_measurements(
-        nose_mass_g=60.0,
-        structure_mass_g=50.0,  # Assumed dry mass of bottle, fins, and hardware
+        nose_mass_g=nose_mass_g,
+        structure_mass_g=50.0,  # 측정값이 아닌 추정치 (보정 대상)
         water_volume_ml=385.0,
         bottle_volume_ml=550.0,
         nozzle_diameter_mm=22.0,
@@ -478,14 +479,17 @@ if __name__ == "__main__":
     print(f"실측 수평 도달 거리: {actual_range_m:.2f} m")
     print(f"오차: {range_error:+.2f} m")
     print(f"오차율: {percent_error:.2f}%")
+    print("사용자 제공 입력값(변경 없음):")
+    print(f" - 탄두 질량: {nose_mass_g:.0f} g")
+    print(" - 주입수량: 385 mL")
+    print(" - 발사각: 45°")
+    print(" - 게이지 공기압: 40 psi")
 
     calibration_specs = [
-        {"name": "drag_coefficient", "min": 0.2, "max": 0.9, "steps": 28},
-        {"name": "discharge_coefficient", "min": 0.85, "max": 0.99, "steps": 28},
-        {"name": "dry_mass", "min": 0.08, "max": 0.16, "steps": 32},
-        {"name": "water_volume", "min": 0.00018, "max": 0.00050, "steps": 32},
-        {"name": "launch_angle_deg", "min": 30.0, "max": 70.0, "steps": 40},
-        {"name": "initial_air_pressure", "min": P_ATM + 20.0 * PSI_TO_PA, "max": P_ATM + 100.0 * PSI_TO_PA, "steps": 40},
+        # 사용자가 제공하지 않은, 측정 오차가 크기 쉬운 변수만 보정 대상에 포함
+        {"name": "drag_coefficient", "min": 0.35, "max": 0.75, "steps": 24},
+        {"name": "discharge_coefficient", "min": 0.88, "max": 0.97, "steps": 24},
+        {"name": "dry_mass", "min": 0.09, "max": 0.13, "steps": 24},
     ]
 
     tuned_values = calibrate_parameters(scenario_parameters, actual_range_m, calibration_specs)
@@ -498,36 +502,17 @@ if __name__ == "__main__":
     label_map = {
         "drag_coefficient": "항력 계수",
         "discharge_coefficient": "노즐 방출 계수",
-        "dry_mass": "건조 질량",
-        "water_volume": "주입수량",
-        "launch_angle_deg": "발사각",
-        "initial_air_pressure": "초기 공기압",
+        "dry_mass": "구조체 질량(탄두 제외)",
     }
 
     def describe_adjustment(name: str, before: float, after: float) -> str:
         delta = after - before
         if name == "dry_mass":
+            structure_before = (before - nose_mass_g / 1000.0) * 1000.0
+            structure_after = (after - nose_mass_g / 1000.0) * 1000.0
             return (
-                f"{label_map[name]}: {before * 1000:.1f} g → {after * 1000:.1f} g "
-                f"(변화량 {delta * 1000:+.1f} g)"
-            )
-        if name == "water_volume":
-            return (
-                f"{label_map[name]}: {before * 1_000_000:.0f} mL → {after * 1_000_000:.0f} mL "
-                f"(변화량 {delta * 1_000_000:+.0f} mL)"
-            )
-        if name == "launch_angle_deg":
-            return (
-                f"{label_map[name]}: {before:.1f}° → {after:.1f}° "
-                f"(변화량 {delta:+.1f}°)"
-            )
-        if name == "initial_air_pressure":
-            before_gauge = (before - P_ATM) / PSI_TO_PA
-            after_gauge = (after - P_ATM) / PSI_TO_PA
-            delta_gauge = after_gauge - before_gauge
-            return (
-                f"{label_map[name]}: {before_gauge:.1f} psi → {after_gauge:.1f} psi "
-                f"(변화량 {delta_gauge:+.1f} psi)"
+                f"{label_map[name]}: {structure_before:.1f} g → {structure_after:.1f} g "
+                f"(변화량 {structure_after - structure_before:+.1f} g)"
             )
         return f"{label_map[name]}: {before:.3f} → {after:.3f} (변화량 {delta:+.3f})"
 
@@ -542,3 +527,4 @@ if __name__ == "__main__":
     print(f"보정 후 비행 시간: {tuned_result['time'][-1]:.2f} s")
     print(f"보정 후 오차: {tuned_error:+.2f} m")
     print(f"보정 후 오차율: {tuned_percent_error:.2f}%")
+    print("※ 보정 과정에서도 사용자 입력값(탄두 질량 60 g, 물 385 mL, 발사각 45°, 공기압 40 psi)은 그대로 유지했습니다.")
