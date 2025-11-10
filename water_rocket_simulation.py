@@ -376,6 +376,9 @@ def calibrate_parameters(
     base_parameters: RocketParameters,
     target_range: float,
     search_specs: List[Dict[str, float]],
+    *,
+    target_time_window: tuple[float, float] | None = None,
+    time_weight: float = 1.0,
 ) -> Dict[str, float]:
     """Sequentially tune selected parameters to reduce range error.
 
@@ -397,9 +400,26 @@ def calibrate_parameters(
     """
 
     tuned_parameters = base_parameters
-    current_range = compute_range(tuned_parameters)
+    base_result = simulate_flight(tuned_parameters)
+    current_range = base_result["range"][0]
+    current_time = base_result["time"][-1]
 
     tuned_values: Dict[str, float] = {}
+
+    def objective(range_value: float, time_value: float) -> float:
+        range_error = abs(range_value - target_range)
+        if target_time_window is None:
+            return range_error
+
+        lower, upper = target_time_window
+        if time_value < lower:
+            time_penalty = lower - time_value
+        elif time_value > upper:
+            time_penalty = time_value - upper
+        else:
+            time_penalty = 0.0
+
+        return range_error + time_weight * time_penalty
 
     for spec in search_specs:
         name = spec["name"]
@@ -409,22 +429,27 @@ def calibrate_parameters(
 
         best_value = getattr(tuned_parameters, name)
         best_range = current_range
-        best_error = abs(best_range - target_range)
+        best_time = current_time
+        best_error = objective(best_range, best_time)
 
         for step in range(steps + 1):
             fraction = step / steps
             candidate_value = min_value + (max_value - min_value) * fraction
             candidate_parameters = replace(tuned_parameters, **{name: candidate_value})
-            candidate_range = compute_range(candidate_parameters)
-            candidate_error = abs(candidate_range - target_range)
+            candidate_result = simulate_flight(candidate_parameters)
+            candidate_range = candidate_result["range"][0]
+            candidate_time = candidate_result["time"][-1]
+            candidate_error = objective(candidate_range, candidate_time)
 
             if candidate_error < best_error:
                 best_error = candidate_error
                 best_value = candidate_value
                 best_range = candidate_range
+                best_time = candidate_time
 
         tuned_parameters = replace(tuned_parameters, **{name: best_value})
         current_range = best_range
+        current_time = best_time
         tuned_values[name] = best_value
 
     return tuned_values
@@ -449,7 +474,7 @@ if __name__ == "__main__":
         structure_mass_g=50.0,  # 측정값이 아닌 추정치 (보정 대상)
         water_volume_ml=385.0,
         bottle_volume_ml=3000.0,  # 1.5 L 페트병 2개 연결 구조
-        nozzle_diameter_mm=22.0,
+        nozzle_diameter_mm=20.0,
         body_diameter_mm=88.0,  # 1.5 L 페트병의 대표 직경
         launch_angle_deg=45.0,
         initial_air_pressure_psi=40.0,
@@ -466,7 +491,7 @@ if __name__ == "__main__":
     percent_error = abs(range_error) / actual_range_m * 100.0
     print(
         "시나리오: 탄두 60 g, 물 385 mL, 발사각 45°, 게이지 공기압 40 psi"
-        " (1.5 L 페트병 2개 결합 기체)"
+        " (1.5 L 페트병 2개 결합 기체, 노즐 지름 20 mm)"
     )
     print(
         "발사 조건: {loc}, {dt}, 기온 {temp:.1f}°C, 바람 {wind:.1f} m/s".format(
@@ -487,15 +512,22 @@ if __name__ == "__main__":
     print(" - 주입수량: 385 mL")
     print(" - 발사각: 45°")
     print(" - 게이지 공기압: 40 psi")
+    print("추가 요구사항: 비행 시간 4.0~4.5 s 충족 (사용자 미제공 변수만 조정)")
 
     calibration_specs = [
         # 사용자가 제공하지 않은, 측정 오차가 크기 쉬운 변수만 보정 대상에 포함
-        {"name": "drag_coefficient", "min": 0.35, "max": 0.75, "steps": 24},
-        {"name": "discharge_coefficient", "min": 0.88, "max": 0.97, "steps": 24},
-        {"name": "dry_mass", "min": 0.09, "max": 0.13, "steps": 24},
+        {"name": "drag_coefficient", "min": 0.15, "max": 0.80, "steps": 32},
+        {"name": "discharge_coefficient", "min": 0.88, "max": 1.00, "steps": 32},
+        {"name": "dry_mass", "min": 0.09, "max": 0.18, "steps": 32},
     ]
 
-    tuned_values = calibrate_parameters(scenario_parameters, actual_range_m, calibration_specs)
+    tuned_values = calibrate_parameters(
+        scenario_parameters,
+        actual_range_m,
+        calibration_specs,
+        target_time_window=(4.0, 4.5),
+        time_weight=60.0,
+    )
     tuned_parameters = replace(scenario_parameters, **tuned_values)
     tuned_result = simulate_flight(tuned_parameters)
     tuned_range = tuned_result["range"][0]
