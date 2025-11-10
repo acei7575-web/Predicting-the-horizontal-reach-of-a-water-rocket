@@ -289,7 +289,6 @@ def compute_range(parameters: RocketParameters) -> float:
 def build_parameters_from_measurements(
     *,
     nose_mass_g: float,
-    structure_mass_g: float,
     water_volume_ml: float,
     bottle_volume_ml: float,
     nozzle_diameter_mm: float,
@@ -312,9 +311,9 @@ def build_parameters_from_measurements(
 
     Parameters
     ----------
-    nose_mass_g, structure_mass_g:
-        Mass of the detachable payload/nose and of the remaining dry structure
-        (bottle shell, fins, glue, etc.) in grams.
+    nose_mass_g:
+        Total dry mass of the rocket expressed in grams.  The current scenario
+        interprets the measured nose mass as the entire dry structure mass.
     water_volume_ml, bottle_volume_ml:
         Filled water volume and the total internal capacity of the pressure
         vessel in millilitres.
@@ -344,7 +343,7 @@ def build_parameters_from_measurements(
         Local gravitational acceleration.
     """
 
-    dry_mass = (nose_mass_g + structure_mass_g) / 1000.0
+    dry_mass = nose_mass_g / 1000.0
     water_volume = water_volume_ml / 1_000_000.0
     bottle_volume = bottle_volume_ml / 1_000_000.0
     nozzle_diameter = nozzle_diameter_mm / 1000.0
@@ -471,7 +470,6 @@ if __name__ == "__main__":
     nose_mass_g = 60.0
     scenario_parameters = build_parameters_from_measurements(
         nose_mass_g=nose_mass_g,
-        structure_mass_g=50.0,  # 측정값이 아닌 추정치 (보정 대상)
         water_volume_ml=385.0,
         bottle_volume_ml=3000.0,  # 1.5 L 페트병 2개 연결 구조
         nozzle_diameter_mm=20.0,
@@ -508,7 +506,7 @@ if __name__ == "__main__":
     print(f"오차: {range_error:+.2f} m")
     print(f"오차율: {percent_error:.2f}%")
     print("사용자 제공 입력값(변경 없음):")
-    print(f" - 탄두 질량: {nose_mass_g:.0f} g")
+    print(f" - 탄두 질량: {nose_mass_g:.0f} g (전체 건조 질량으로 사용)")
     print(" - 주입수량: 385 mL")
     print(" - 발사각: 45°")
     print(" - 게이지 공기압: 40 psi")
@@ -518,7 +516,6 @@ if __name__ == "__main__":
         # 사용자가 제공하지 않은, 측정 오차가 크기 쉬운 변수만 보정 대상에 포함
         {"name": "drag_coefficient", "min": 0.15, "max": 0.80, "steps": 32},
         {"name": "discharge_coefficient", "min": 0.88, "max": 1.00, "steps": 32},
-        {"name": "dry_mass", "min": 0.09, "max": 0.18, "steps": 32},
     ]
 
     tuned_values = calibrate_parameters(
@@ -537,18 +534,10 @@ if __name__ == "__main__":
     label_map = {
         "drag_coefficient": "항력 계수",
         "discharge_coefficient": "노즐 방출 계수",
-        "dry_mass": "구조체 질량(탄두 제외)",
     }
 
     def describe_adjustment(name: str, before: float, after: float) -> str:
         delta = after - before
-        if name == "dry_mass":
-            structure_before = (before - nose_mass_g / 1000.0) * 1000.0
-            structure_after = (after - nose_mass_g / 1000.0) * 1000.0
-            return (
-                f"{label_map[name]}: {structure_before:.1f} g → {structure_after:.1f} g "
-                f"(변화량 {structure_after - structure_before:+.1f} g)"
-            )
         return f"{label_map[name]}: {before:.3f} → {after:.3f} (변화량 {delta:+.3f})"
 
     print("\n오차율 최소화를 위한 변수 조정 결과:")
