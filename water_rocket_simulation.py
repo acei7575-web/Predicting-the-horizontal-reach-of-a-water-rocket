@@ -1,17 +1,19 @@
-"""Water rocket flight simulation.
+"""Water rocket flight simulation and analysis toolkit.
 
-This module provides a time-domain simulator for a two-dimensional water rocket.
-The model resolves the thrust produced while water is expelled, includes the
-mass variation due to the remaining water, and accounts for aerodynamic drag and
-gravity.  The primary output is the horizontal range of the rocket, but the full
-state history is also returned for further analysis.
+This module provides a physics-based time-domain simulator for a two-phase
+water rocket.  The solver resolves the water expulsion phase using
+polytropic compression of the trapped air, transitions to an air-only
+expansion model that supports choked and unchoked nozzle flow, and integrates
+ballistic motion with aerodynamic drag.  In addition to the core solver, the
+module exposes helper utilities for parameter conversion, calibration, and
+sensitivity analysis tailored to the scenario described in the prompt.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 
 R_AIR = 287.058  # Specific gas constant for dry air (J/(kg·K))
@@ -41,40 +43,7 @@ def estimate_air_density(temperature_c: float, *, pressure_pa: float = P_ATM) ->
 
 @dataclass
 class RocketParameters:
-    """Container for the physical properties of the water rocket.
-
-    Attributes
-    ----------
-    dry_mass:
-        Mass of the empty rocket (kg).
-    water_volume:
-        Initial volume of the water inside the bottle (m^3).
-    bottle_volume:
-        Total interior volume of the pressure vessel (m^3).
-    nozzle_diameter:
-        Diameter of the nozzle exit (m).
-    discharge_coefficient:
-        Empirical discharge coefficient (dimensionless, typically 0.8--1.0).
-    drag_coefficient:
-        Quadratic drag coefficient referenced to ``cross_sectional_area``.
-    cross_sectional_area:
-        Reference area used for the drag calculation (m^2).
-    initial_air_pressure:
-        Absolute pressure of the compressed air at launch (Pa).
-    air_temperature:
-        Absolute temperature of the compressed air (K).  Used to estimate the
-        initial mass of the trapped air.
-    launch_angle_deg:
-        Launch rail elevation angle (degrees above the horizontal).
-    time_step:
-        Integration time step (s).
-    max_time:
-        Maximum simulation time before aborting (s).
-    air_density:
-        Ambient air density for aerodynamic drag (kg/m^3).
-    gravity:
-        Magnitude of the gravitational acceleration (m/s^2).
-    """
+    """Container for the physical properties of the water rocket."""
 
     dry_mass: float
     water_volume: float
@@ -90,55 +59,163 @@ class RocketParameters:
     max_time: float = 30.0
     air_density: float = 1.225
     gravity: float = 9.80665
+    polytropic_exponent: float = 1.2
 
 
-def simulate_flight(parameters: RocketParameters) -> Dict[str, List[float]]:
-    """Simulate the flight of a water rocket.
+def nozzle_water_flow(
+    pressure_pa: float,
+    ambient_pressure_pa: float,
+    discharge_coefficient: float,
+    nozzle_area: float,
+    *,
+    fluid_density: float = RHO_WATER,
+) -> Tuple[float, float, float]:
+    """Compute the water-phase mass flow rate, exit velocity, and thrust.
 
-    Parameters
-    ----------
-    parameters:
-        Fully-populated :class:`RocketParameters` describing the rocket.
-
-    Returns
-    -------
-    dict
-        Time history of the simulation with the following keys:
-
-        ``"time"`` (s), ``"x"`` (m), ``"y"`` (m), ``"vx"`` (m/s), ``"vy"`` (m/s),
-        ``"mass"`` (kg), ``"pressure"`` (Pa) and ``"thrust"`` (N).
-
-        The final entry of the ``"x"`` series corresponds to the interpolated
-        horizontal range when the rocket returns to ground level.
-
-    Raises
-    ------
-    ValueError
-        If the supplied parameters are physically inconsistent.
+    The function assumes Bernoulli flow from a high-pressure reservoir to the
+    ambient environment.  The resulting units are verified at runtime to catch
+    accidental unit inconsistencies.
     """
 
+    if pressure_pa <= ambient_pressure_pa or nozzle_area <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    if fluid_density <= 0.0:
+        raise ValueError("Fluid density must be positive for nozzle flow calculations.")
+
+    delta_p = pressure_pa - ambient_pressure_pa
+    exit_velocity = math.sqrt(2.0 * delta_p / fluid_density)
+    mass_flow_rate = discharge_coefficient * fluid_density * nozzle_area * exit_velocity
+
+    # Unit sanity check: [kg/s] = [kg/m^3] * [m^2] * [m/s]
+    unit_check = fluid_density * nozzle_area * exit_velocity
+    if not math.isclose(mass_flow_rate, discharge_coefficient * unit_check, rel_tol=1e-9):
+        raise AssertionError("Water nozzle mass-flow units inconsistent.")
+
+    thrust = mass_flow_rate * exit_velocity
+    return mass_flow_rate, exit_velocity, thrust
+
+
+def update_tank_pressure_water(
+    *,
+    polytropic_constant: float,
+    air_volume: float,
+    polytropic_exponent: float,
+    ambient_pressure: float = P_ATM,
+) -> float:
+    """Update the trapped air pressure during the water expulsion phase.
+
+    The relation :math:`p V^n = C` is enforced, where ``n`` is the supplied
+    polytropic exponent.  The resulting pressure is never allowed to drop below
+    the ambient value so that the solver can detect the end of the water phase.
+    """
+
+    if air_volume <= 0.0:
+        raise ValueError("Air volume must remain positive inside the bottle.")
+    if polytropic_exponent <= 0.0:
+        raise ValueError("Polytropic exponent must be positive.")
+
+    pressure = polytropic_constant / (air_volume ** polytropic_exponent)
+    if pressure < 0.0 or not math.isfinite(pressure):
+        raise ArithmeticError("Computed an invalid reservoir pressure during water phase.")
+
+    return max(pressure, ambient_pressure)
+
+
+def nozzle_air_flow(
+    pressure_pa: float,
+    reservoir_temperature_k: float,
+    ambient_pressure_pa: float,
+    discharge_coefficient: float,
+    nozzle_area: float,
+    gamma: float = GAMMA_AIR,
+) -> Tuple[float, float, float]:
+    """Return mass flow, exit velocity, and exit pressure during the air phase."""
+
+    if pressure_pa <= ambient_pressure_pa or nozzle_area <= 0.0:
+        return 0.0, 0.0, ambient_pressure_pa
+    if reservoir_temperature_k <= 0.0:
+        raise ValueError("Reservoir temperature must remain positive.")
+
+    critical_ratio = (2.0 / (gamma + 1.0)) ** (gamma / (gamma - 1.0))
+    pressure_ratio = ambient_pressure_pa / pressure_pa
+
+    if pressure_ratio <= critical_ratio:
+        # Choked flow (Mach 1 at the nozzle throat).
+        exit_pressure = pressure_pa * critical_ratio
+        exit_temperature = reservoir_temperature_k * (2.0 / (gamma + 1.0))
+        mass_flow_rate = (
+            discharge_coefficient
+            * nozzle_area
+            * pressure_pa
+            * math.sqrt(gamma / (R_AIR * reservoir_temperature_k))
+            * (2.0 / (gamma + 1.0)) ** ((gamma + 1.0) / (2.0 * (gamma - 1.0)))
+        )
+        exit_velocity = math.sqrt(gamma * R_AIR * exit_temperature)
+    else:
+        # Subsonic (unchoked) regime.
+        exit_pressure = ambient_pressure_pa
+        pressure_term = pressure_ratio ** ((gamma - 1.0) / gamma)
+        energy_term = max(0.0, 1.0 - pressure_term)
+        exit_temperature = reservoir_temperature_k * pressure_term
+        velocity_term = max(0.0, 2.0 * gamma / (gamma - 1.0) * R_AIR * reservoir_temperature_k * energy_term)
+        exit_velocity = math.sqrt(velocity_term)
+        flow_term = (
+            2.0
+            * gamma
+            / (R_AIR * reservoir_temperature_k * (gamma - 1.0))
+            * pressure_ratio ** (2.0 / gamma)
+            * energy_term
+        )
+        mass_flow_rate = discharge_coefficient * nozzle_area * pressure_pa * math.sqrt(max(flow_term, 0.0))
+
+    if not math.isfinite(mass_flow_rate) or mass_flow_rate < 0.0:
+        mass_flow_rate = 0.0
+    if not math.isfinite(exit_velocity) or exit_velocity < 0.0:
+        exit_velocity = 0.0
+
+    return mass_flow_rate, exit_velocity, exit_pressure
+
+
+def simulate_flight(
+    parameters: RocketParameters,
+    *,
+    log_events: bool = False,
+) -> Dict[str, List[float]]:
+    """Simulate the flight of a water rocket with detailed phase modeling."""
+
     params = parameters
-    if params.bottle_volume <= 0:
+    if params.bottle_volume <= 0.0:
         raise ValueError("Bottle volume must be positive.")
-    if params.water_volume < 0 or params.water_volume >= params.bottle_volume:
+    if params.water_volume < 0.0 or params.water_volume >= params.bottle_volume:
         raise ValueError("Water volume must be within (0, bottle_volume).")
     if params.initial_air_pressure <= P_ATM:
         raise ValueError("Initial air pressure must exceed atmospheric pressure.")
+    if params.polytropic_exponent <= 0.0:
+        raise ValueError("Polytropic exponent must be positive.")
 
     orientation = math.radians(params.launch_angle_deg)
     nozzle_area = math.pi * (params.nozzle_diameter * 0.5) ** 2
 
     water_mass = RHO_WATER * params.water_volume
+    current_water_volume = params.water_volume
     initial_air_volume = params.bottle_volume - params.water_volume
+    if initial_air_volume <= 0.0:
+        raise ValueError("Initial air volume must be positive.")
+
     initial_air_mass = (
-        params.initial_air_pressure
-        * initial_air_volume
-        / (R_AIR * params.air_temperature)
+        params.initial_air_pressure * initial_air_volume / (R_AIR * params.air_temperature)
     )
+    if initial_air_mass <= 0.0:
+        raise ValueError("Initial air mass must be positive.")
 
     total_mass = params.dry_mass + water_mass + initial_air_mass
-    if total_mass <= 0:
+    if total_mass <= 0.0:
         raise ValueError("Total mass must be positive.")
+
+    water_polytropic_constant = params.initial_air_pressure * (
+        initial_air_volume ** params.polytropic_exponent
+    )
 
     time = 0.0
     x = 0.0
@@ -146,104 +223,192 @@ def simulate_flight(parameters: RocketParameters) -> Dict[str, List[float]]:
     vx = 0.0
     vy = 0.0
 
+    air_mass = initial_air_mass
+    air_volume = initial_air_volume
+    tank_pressure = params.initial_air_pressure
+    air_phase_constant = None
+    transition_logged = False
+
     time_history: List[float] = [time]
     x_history: List[float] = [x]
     y_history: List[float] = [y]
     vx_history: List[float] = [vx]
     vy_history: List[float] = [vy]
     mass_history: List[float] = [total_mass]
-    pressure_history: List[float] = [params.initial_air_pressure]
+    pressure_history: List[float] = [tank_pressure]
     thrust_history: List[float] = [0.0]
-
-    current_water_volume = params.water_volume
-    current_air_pressure = params.initial_air_pressure
 
     cos_theta = math.cos(orientation)
     sin_theta = math.sin(orientation)
 
     while time < params.max_time:
-        dt = params.time_step
+        dt_remaining = params.time_step
+        while dt_remaining > 1e-12:
+            speed = math.hypot(vx, vy)
+            if speed > 1e-6:
+                thrust_dir_x = vx / speed
+                thrust_dir_y = vy / speed
+            else:
+                thrust_dir_x = cos_theta
+                thrust_dir_y = sin_theta
 
-        # Update orientation: align thrust with current velocity when moving.
-        speed = math.hypot(vx, vy)
-        if speed > 1e-6:
-            thrust_dir_x = vx / speed
-            thrust_dir_y = vy / speed
-        else:
-            thrust_dir_x = cos_theta
-            thrust_dir_y = sin_theta
+            total_mass = params.dry_mass + water_mass + air_mass
+            if total_mass <= 0.0:
+                raise ArithmeticError("Non-positive total mass encountered during integration.")
 
-        thrust = 0.0
-        current_pressure = P_ATM
+            water_phase_active = water_mass > 1e-9 and current_water_volume > 1e-9
 
-        if water_mass > 1e-9:
-            current_air_volume = params.bottle_volume - current_water_volume
-            current_air_volume = max(current_air_volume, 1e-9)
-            current_pressure = params.initial_air_pressure * (
-                initial_air_volume / current_air_volume
-            ) ** GAMMA_AIR
+            thrust = 0.0
+            exit_pressure = P_ATM
+            actual_dt = dt_remaining
+            delta_water = 0.0
+            delta_air = 0.0
 
-            if current_pressure > P_ATM:
-                exit_velocity = math.sqrt(2.0 * (current_pressure - P_ATM) / RHO_WATER)
-                mass_flow_rate = (
-                    params.discharge_coefficient
-                    * RHO_WATER
-                    * nozzle_area
-                    * exit_velocity
+            if water_phase_active:
+                previous_water_mass = water_mass
+                air_volume = params.bottle_volume - current_water_volume
+                tank_pressure = update_tank_pressure_water(
+                    polytropic_constant=water_polytropic_constant,
+                    air_volume=air_volume,
+                    polytropic_exponent=params.polytropic_exponent,
+                    ambient_pressure=P_ATM,
                 )
 
-                max_mdot = water_mass / dt
-                mass_flow_rate = min(mass_flow_rate, max_mdot)
+                if tank_pressure <= P_ATM:
+                    water_mass = 0.0
+                    current_water_volume = 0.0
+                    air_volume = params.bottle_volume
+                else:
+                    mass_flow_rate, exit_velocity, thrust = nozzle_water_flow(
+                        tank_pressure,
+                        P_ATM,
+                        params.discharge_coefficient,
+                        nozzle_area,
+                    )
+                    if mass_flow_rate > 0.0:
+                        max_dt = water_mass / mass_flow_rate
+                        actual_dt = min(dt_remaining, max_dt)
+                        delta_water = mass_flow_rate * actual_dt
+                    else:
+                        actual_dt = dt_remaining
+                        delta_water = 0.0
 
-                thrust = mass_flow_rate * exit_velocity
-                delta_mass = mass_flow_rate * dt
-
-                water_mass = max(water_mass - delta_mass, 0.0)
-                current_water_volume = water_mass / RHO_WATER
-                total_mass = params.dry_mass + water_mass + initial_air_mass
+                if water_mass <= 0.0:
+                    current_water_volume = 0.0
+                    air_volume = params.bottle_volume
+                    if air_mass > 0.0:
+                        rho_air = air_mass / air_volume
+                        air_phase_constant = tank_pressure / (rho_air ** GAMMA_AIR)
+                    else:
+                        air_phase_constant = None
             else:
-                current_pressure = P_ATM
-                thrust = 0.0
-        else:
-            total_mass = params.dry_mass + initial_air_mass
+                air_volume = params.bottle_volume
+                if air_phase_constant is None and air_mass > 0.0:
+                    rho_air = air_mass / air_volume
+                    air_phase_constant = max(tank_pressure, P_ATM) / (rho_air ** GAMMA_AIR)
 
-        drag_x = 0.0
-        drag_y = 0.0
-        if speed > 1e-6:
-            drag_magnitude = (
-                0.5
-                * params.air_density
-                * params.drag_coefficient
-                * params.cross_sectional_area
-                * speed
-                * speed
-            )
-            drag_x = -drag_magnitude * vx / speed
-            drag_y = -drag_magnitude * vy / speed
+                if air_mass <= 1e-9:
+                    tank_pressure = P_ATM
+                    thrust = 0.0
+                else:
+                    tank_pressure = air_phase_constant * ((air_mass / air_volume) ** GAMMA_AIR)
+                    if tank_pressure <= P_ATM:
+                        tank_pressure = P_ATM
+                        thrust = 0.0
+                    else:
+                        reservoir_temperature = tank_pressure * air_volume / (air_mass * R_AIR)
+                        mass_flow_rate, exit_velocity, exit_pressure = nozzle_air_flow(
+                            tank_pressure,
+                            reservoir_temperature,
+                            P_ATM,
+                            params.discharge_coefficient,
+                            nozzle_area,
+                        )
+                        if mass_flow_rate > 0.0:
+                            max_dt = air_mass / mass_flow_rate
+                            actual_dt = min(dt_remaining, max_dt)
+                            delta_air = mass_flow_rate * actual_dt
+                            thrust = mass_flow_rate * exit_velocity + (
+                                exit_pressure - P_ATM
+                            ) * nozzle_area
+                        else:
+                            actual_dt = dt_remaining
+                            delta_air = 0.0
+                            thrust = 0.0
 
-        thrust_x = thrust * thrust_dir_x
-        thrust_y = thrust * thrust_dir_y
+            drag_x = 0.0
+            drag_y = 0.0
+            if speed > 1e-6:
+                drag_magnitude = (
+                    0.5
+                    * params.air_density
+                    * params.drag_coefficient
+                    * params.cross_sectional_area
+                    * speed
+                    * speed
+                )
+                drag_x = -drag_magnitude * vx / speed
+                drag_y = -drag_magnitude * vy / speed
 
-        gravity_force = -total_mass * params.gravity
+            gravity_force = -total_mass * params.gravity
 
-        ax = (thrust_x + drag_x) / total_mass
-        ay = (thrust_y + drag_y + gravity_force) / total_mass
+            ax = (thrust * thrust_dir_x + drag_x) / total_mass
+            ay = (thrust * thrust_dir_y + drag_y + gravity_force) / total_mass
 
-        vx += ax * dt
-        vy += ay * dt
-        x += vx * dt
-        y += vy * dt
+            vx += ax * actual_dt
+            vy += ay * actual_dt
+            x += vx * actual_dt
+            y += vy * actual_dt
 
-        time += dt
+            if delta_water > 0.0:
+                water_mass = max(water_mass - delta_water, 0.0)
+                current_water_volume = water_mass / RHO_WATER
+                assert math.isclose(
+                    current_water_volume,
+                    water_mass / RHO_WATER,
+                    rel_tol=1e-6,
+                    abs_tol=1e-9,
+                ), "Water mass/volume inconsistency detected."
+                if water_mass <= 1e-9 and previous_water_mass > 1e-9 and not transition_logged:
+                    tank_pressure = update_tank_pressure_water(
+                        polytropic_constant=water_polytropic_constant,
+                        air_volume=params.bottle_volume,
+                        polytropic_exponent=params.polytropic_exponent,
+                        ambient_pressure=P_ATM,
+                    )
+                    rho_air = air_mass / params.bottle_volume if air_mass > 0.0 else 0.0
+                    if air_mass > 0.0 and rho_air > 0.0:
+                        air_phase_constant = tank_pressure / (rho_air ** GAMMA_AIR)
+                    transition_logged = True
+                    if log_events:
+                        transition_speed = math.hypot(vx, vy)
+                        print(
+                            "[전환 이벤트] t={:.3f} s, 속도={:.2f} m/s, 압력={:.1f} kPa".format(
+                                time + actual_dt,
+                                transition_speed,
+                                tank_pressure / 1000.0,
+                            )
+                        )
+            if delta_air > 0.0:
+                air_mass = max(air_mass - delta_air, 0.0)
+                if air_mass <= 1e-9:
+                    tank_pressure = P_ATM
 
-        time_history.append(time)
-        x_history.append(x)
-        y_history.append(y)
-        vx_history.append(vx)
-        vy_history.append(vy)
-        mass_history.append(total_mass)
-        pressure_history.append(current_pressure)
-        thrust_history.append(thrust)
+            time += actual_dt
+            dt_remaining -= actual_dt
+
+            total_mass = params.dry_mass + water_mass + air_mass
+            time_history.append(time)
+            x_history.append(x)
+            y_history.append(y)
+            vx_history.append(vx)
+            vy_history.append(vy)
+            mass_history.append(total_mass)
+            pressure_history.append(tank_pressure)
+            thrust_history.append(thrust)
+
+            if y < 0.0 and time > 0.0:
+                break
 
         if y < 0.0 and time > 0.0:
             break
@@ -302,46 +467,9 @@ def build_parameters_from_measurements(
     max_time: float = 30.0,
     air_density: float = 1.2,
     gravity: float = 9.80665,
+    polytropic_exponent: float = 1.2,
 ) -> RocketParameters:
-    """Convert practical build measurements to :class:`RocketParameters`.
-
-    The helper interprets the supplied values in the units commonly recorded
-    during a launch preparation and returns a :class:`RocketParameters`
-    instance ready for the numerical solver.
-
-    Parameters
-    ----------
-    nose_mass_g:
-        Total dry mass of the rocket expressed in grams.  The current scenario
-        interprets the measured nose mass as the entire dry structure mass.
-    water_volume_ml, bottle_volume_ml:
-        Filled water volume and the total internal capacity of the pressure
-        vessel in millilitres.
-    nozzle_diameter_mm, body_diameter_mm:
-        Diameter of the nozzle throat and the main body diameter in millimetres.
-    launch_angle_deg:
-        Elevation angle of the launch guide relative to the horizon.
-    initial_air_pressure_psi:
-        Gauge pressure of the compressed air measured in pounds per square
-        inch.  The conversion accounts for atmospheric pressure to yield the
-        absolute pressure required by the thermodynamic model.
-    discharge_coefficient:
-        Empirical discharge coefficient for the nozzle.
-    drag_coefficient:
-        Aerodynamic drag coefficient referenced to the frontal area defined by
-        ``body_diameter_mm``.
-    air_temperature_c:
-        Launch-day air temperature in degrees Celsius.
-    time_step:
-        Integration time step for :func:`simulate_flight`.
-    max_time:
-        Maximum simulation duration; the integrator halts early when the rocket
-        returns to the ground.
-    air_density:
-        Free-stream air density used by the drag model.
-    gravity:
-        Local gravitational acceleration.
-    """
+    """Convert practical build measurements to :class:`RocketParameters`."""
 
     dry_mass = nose_mass_g / 1000.0
     water_volume = water_volume_ml / 1_000_000.0
@@ -368,35 +496,19 @@ def build_parameters_from_measurements(
         max_time=max_time,
         air_density=air_density,
         gravity=gravity,
+        polytropic_exponent=polytropic_exponent,
     )
 
 
 def calibrate_parameters(
     base_parameters: RocketParameters,
     target_range: float,
-    search_specs: List[Dict[str, float]],
+    search_specs: Sequence[Dict[str, float]],
     *,
-    target_time_window: tuple[float, float] | None = None,
+    target_time_window: Tuple[float, float] | None = None,
     time_weight: float = 1.0,
 ) -> Dict[str, float]:
-    """Sequentially tune selected parameters to reduce range error.
-
-    Parameters
-    ----------
-    base_parameters:
-        Initial :class:`RocketParameters` generated from measurement data.
-    target_range:
-        Recorded range on the launch field (m).
-    search_specs:
-        Sequence of dictionaries describing the parameter search bounds.  Each
-        entry must include ``"name"``, ``"min"``, ``"max"`` and optionally
-        ``"steps"`` to control the resolution of the grid search.
-
-    Returns
-    -------
-    dict
-        Mapping of parameter names to the tuned values.
-    """
+    """Sequentially tune selected parameters to reduce range error."""
 
     tuned_parameters = base_parameters
     base_result = simulate_flight(tuned_parameters)
@@ -454,6 +566,59 @@ def calibrate_parameters(
     return tuned_values
 
 
+def run_sensitivity_analysis(
+    base_parameters: RocketParameters,
+    cd_values: Sequence[float],
+    n_values: Sequence[float],
+    area_scales: Sequence[float],
+) -> Dict[float, List[List[float]]]:
+    """Evaluate range sensitivity across drag, polytropic exponent, and nozzle area."""
+
+    results: Dict[float, List[List[float]]] = {}
+    for area_scale in area_scales:
+        area_rows: List[List[float]] = []
+        diameter_scale = math.sqrt(area_scale)
+        for cd in cd_values:
+            row: List[float] = []
+            for n in n_values:
+                candidate = replace(
+                    base_parameters,
+                    drag_coefficient=cd,
+                    polytropic_exponent=n,
+                    nozzle_diameter=base_parameters.nozzle_diameter * diameter_scale,
+                )
+                row.append(compute_range(candidate))
+            area_rows.append(row)
+        results[area_scale] = area_rows
+    return results
+
+
+def _format_heatmap_table(
+    cd_values: Sequence[float],
+    n_values: Sequence[float],
+    data: List[List[float]],
+) -> List[str]:
+    """Render a text heatmap for the supplied range data."""
+
+    flat_values = [value for row in data for value in row]
+    v_min = min(flat_values)
+    v_max = max(flat_values)
+    span = max(v_max - v_min, 1e-9)
+    shades = " .:-=+*#%@"
+
+    header = "Cd↓ / n→ | " + " ".join(f"{n:5.2f}" for n in n_values)
+    lines = [header, "-" * len(header)]
+    for cd, row in zip(cd_values, data):
+        entries = []
+        for value in row:
+            normalized = (value - v_min) / span
+            index = min(int(normalized * (len(shades) - 1)), len(shades) - 1)
+            entries.append(f"{value:5.1f}{shades[index]}")
+        lines.append(f"{cd:8.3f} | " + " ".join(entries))
+    lines.append("(문자열 음영: 낮은 값 → ' ', 높은 값 → '@')")
+    return lines
+
+
 if __name__ == "__main__":
     launch_conditions = LaunchConditions(
         location="대한민국",
@@ -466,27 +631,29 @@ if __name__ == "__main__":
         launch_conditions.temperature_c, pressure_pa=launch_conditions.ambient_pressure_pa
     )
 
-    # Launch scenario supplied by the build notes in the prompt.
     nose_mass_g = 60.0
     scenario_parameters = build_parameters_from_measurements(
         nose_mass_g=nose_mass_g,
         water_volume_ml=385.0,
-        bottle_volume_ml=3000.0,  # 1.5 L 페트병 2개 연결 구조
+        bottle_volume_ml=3000.0,
         nozzle_diameter_mm=20.0,
-        body_diameter_mm=88.0,  # 1.5 L 페트병의 대표 직경
+        body_diameter_mm=88.0,
         launch_angle_deg=45.0,
         initial_air_pressure_psi=40.0,
         discharge_coefficient=0.92,
         drag_coefficient=0.5,
         air_temperature_c=launch_conditions.temperature_c,
         air_density=ambient_air_density,
+        polytropic_exponent=1.2,
     )
 
-    result = simulate_flight(scenario_parameters)
+    result = simulate_flight(scenario_parameters, log_events=True)
     range_estimate = result["range"][0]
+    flight_time = result["time"][-1]
     actual_range_m = 89.0
     range_error = range_estimate - actual_range_m
     percent_error = abs(range_error) / actual_range_m * 100.0
+
     print(
         "시나리오: 탄두 60 g, 물 385 mL, 발사각 45°, 게이지 공기압 40 psi"
         " (1.5 L 페트병 2개 결합 기체, 노즐 지름 20 mm)"
@@ -501,7 +668,7 @@ if __name__ == "__main__":
     )
     print(f"추정 대기 밀도: {ambient_air_density:.3f} kg/m³")
     print(f"모의 수평 도달 거리(보정 전): {range_estimate:.2f} m")
-    print(f"비행 시간(보정 전): {result['time'][-1]:.2f} s")
+    print(f"비행 시간(보정 전): {flight_time:.2f} s")
     print(f"실측 수평 도달 거리: {actual_range_m:.2f} m")
     print(f"오차: {range_error:+.2f} m")
     print(f"오차율: {percent_error:.2f}%")
@@ -510,45 +677,72 @@ if __name__ == "__main__":
     print(" - 주입수량: 385 mL")
     print(" - 발사각: 45°")
     print(" - 게이지 공기압: 40 psi")
-    print("추가 요구사항: 비행 시간 4.0~4.5 s 충족 (사용자 미제공 변수만 조정)")
+
+    print("\n[민감도 분석] Cd_body ∈ [0.3, 0.9], n ∈ [1.0, 1.4], 노즐 면적 ±10%")
+    cd_values = [0.30, 0.45, 0.60, 0.75, 0.90]
+    n_values = [1.0, 1.1, 1.2, 1.3, 1.4]
+    area_scales = [0.9, 1.0, 1.1]
+    sensitivity_results = run_sensitivity_analysis(
+        scenario_parameters, cd_values, n_values, area_scales
+    )
+    for scale in area_scales:
+        print(f"\n- 노즐 단면적 스케일 {scale * 100:.0f}%")
+        table_lines = _format_heatmap_table(cd_values, n_values, sensitivity_results[scale])
+        for line in table_lines:
+            print("  " + line)
 
     calibration_specs = [
-        # 사용자가 제공하지 않은, 측정 오차가 크기 쉬운 변수만 보정 대상에 포함
-        {"name": "drag_coefficient", "min": 0.15, "max": 0.80, "steps": 32},
-        {"name": "discharge_coefficient", "min": 0.88, "max": 1.00, "steps": 32},
+        {"name": "drag_coefficient", "min": 0.3, "max": 0.9, "steps": 32},
+        {"name": "polytropic_exponent", "min": 1.0, "max": 1.4, "steps": 32},
     ]
-
     tuned_values = calibrate_parameters(
         scenario_parameters,
         actual_range_m,
         calibration_specs,
-        target_time_window=(4.0, 4.5),
-        time_weight=60.0,
+        target_time_window=None,
     )
     tuned_parameters = replace(scenario_parameters, **tuned_values)
-    tuned_result = simulate_flight(tuned_parameters)
+    tuned_result = simulate_flight(tuned_parameters, log_events=True)
     tuned_range = tuned_result["range"][0]
     tuned_error = tuned_range - actual_range_m
     tuned_percent_error = abs(tuned_error) / actual_range_m * 100.0
 
+    print("\n[캘리브레이션] 실측 사거리 89.0 m 기준")
+    print("  단계 | Cd_body |  n  | 예측 사거리 (m) | 오차 (%)")
+    print(
+        "  기본 | {cd:7.3f} | {n:3.1f} | {rng:17.2f} | {err:7.3f}".format(
+            cd=scenario_parameters.drag_coefficient,
+            n=scenario_parameters.polytropic_exponent,
+            rng=range_estimate,
+            err=percent_error,
+        )
+    )
+    print(
+        "  보정 | {cd:7.3f} | {n:3.1f} | {rng:17.2f} | {err:7.3f}".format(
+            cd=tuned_parameters.drag_coefficient,
+            n=tuned_parameters.polytropic_exponent,
+            rng=tuned_range,
+            err=tuned_percent_error,
+        )
+    )
+
     label_map = {
         "drag_coefficient": "항력 계수",
-        "discharge_coefficient": "노즐 방출 계수",
+        "polytropic_exponent": "다상 지수 n",
     }
 
-    def describe_adjustment(name: str, before: float, after: float) -> str:
-        delta = after - before
-        return f"{label_map[name]}: {before:.3f} → {after:.3f} (변화량 {delta:+.3f})"
-
-    print("\n오차율 최소화를 위한 변수 조정 결과:")
+    print("\n보정된 변수 변화:")
     for spec in calibration_specs:
         name = spec["name"]
         before = getattr(scenario_parameters, name)
         after = tuned_values[name]
-        print(" - " + describe_adjustment(name, before, after))
+        delta = after - before
+        print(
+            f" - {label_map[name]}: {before:.3f} → {after:.3f} (변화량 {delta:+.3f})"
+        )
 
-    print(f"\n보정 후 모의 수평 도달 거리: {tuned_range:.2f} m")
-    print(f"보정 후 비행 시간: {tuned_result['time'][-1]:.2f} s")
-    print(f"보정 후 오차: {tuned_error:+.2f} m")
-    print(f"보정 후 오차율: {tuned_percent_error:.2f}%")
-    print("※ 보정 과정에서도 사용자 입력값(탄두 질량 60 g, 물 385 mL, 발사각 45°, 공기압 40 psi)은 그대로 유지했습니다.")
+    print("\n보정 후 모의 수평 도달 거리: {:.2f} m".format(tuned_range))
+    print("보정 후 비행 시간: {:.2f} s".format(tuned_result["time"][-1]))
+    print("보정 후 오차: {:+.2f} m".format(tuned_error))
+    print("보정 후 오차율: {:.2f}%".format(tuned_percent_error))
+    print("※ 사용자 입력값(탄두 질량 60 g, 물 385 mL, 발사각 45°, 공기압 40 psi)은 그대로 유지했습니다.")
