@@ -448,9 +448,9 @@ if __name__ == "__main__":
         nose_mass_g=nose_mass_g,
         structure_mass_g=50.0,  # 측정값이 아닌 추정치 (보정 대상)
         water_volume_ml=385.0,
-        bottle_volume_ml=550.0,
+        bottle_volume_ml=3000.0,  # 1.5 L 페트병 2개 연결 구조
         nozzle_diameter_mm=22.0,
-        body_diameter_mm=65.0,
+        body_diameter_mm=88.0,  # 1.5 L 페트병의 대표 직경
         launch_angle_deg=45.0,
         initial_air_pressure_psi=40.0,
         discharge_coefficient=0.92,
@@ -464,7 +464,10 @@ if __name__ == "__main__":
     actual_range_m = 89.0
     range_error = range_estimate - actual_range_m
     percent_error = abs(range_error) / actual_range_m * 100.0
-    print("시나리오: 탄두 60 g, 물 385 mL, 발사각 45°, 게이지 공기압 40 psi")
+    print(
+        "시나리오: 탄두 60 g, 물 385 mL, 발사각 45°, 게이지 공기압 40 psi"
+        " (1.5 L 페트병 2개 결합 기체)"
+    )
     print(
         "발사 조건: {loc}, {dt}, 기온 {temp:.1f}°C, 바람 {wind:.1f} m/s".format(
             loc=launch_conditions.location,
