@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, List
 
 
@@ -18,25 +17,6 @@ R_AIR = 287.058  # Specific gas constant for dry air (J/(kg·K))
 GAMMA_AIR = 1.4
 RHO_WATER = 1000.0  # kg/m^3
 P_ATM = 101_325.0  # Pa
-PSI_TO_PA = 6_894.75729  # Exact conversion for lbf/in^2 to Pa
-
-
-@dataclass
-class LaunchConditions:
-    """Metadata describing the environment of a particular launch."""
-
-    location: str
-    date_time: datetime
-    temperature_c: float
-    ambient_pressure_pa: float = P_ATM
-    wind_speed_m_per_s: float = 0.0
-
-
-def estimate_air_density(temperature_c: float, *, pressure_pa: float = P_ATM) -> float:
-    """Estimate air density from temperature and pressure assuming dry air."""
-
-    temperature_k = temperature_c + 273.15
-    return pressure_pa / (R_AIR * temperature_k)
 
 
 @dataclass
@@ -284,139 +264,3 @@ def compute_range(parameters: RocketParameters) -> float:
 
     history = simulate_flight(parameters)
     return history["range"][0]
-
-
-def build_parameters_from_measurements(
-    *,
-    nose_mass_g: float,
-    structure_mass_g: float,
-    water_volume_ml: float,
-    bottle_volume_ml: float,
-    nozzle_diameter_mm: float,
-    body_diameter_mm: float,
-    launch_angle_deg: float,
-    initial_air_pressure_psi: float,
-    discharge_coefficient: float = 0.92,
-    drag_coefficient: float = 0.5,
-    air_temperature_c: float = 25.0,
-    time_step: float = 5e-4,
-    max_time: float = 30.0,
-    air_density: float = 1.2,
-    gravity: float = 9.80665,
-) -> RocketParameters:
-    """Convert practical build measurements to :class:`RocketParameters`.
-
-    The helper interprets the supplied values in the units commonly recorded
-    during a launch preparation and returns a :class:`RocketParameters`
-    instance ready for the numerical solver.
-
-    Parameters
-    ----------
-    nose_mass_g, structure_mass_g:
-        Mass of the detachable payload/nose and of the remaining dry structure
-        (bottle shell, fins, glue, etc.) in grams.
-    water_volume_ml, bottle_volume_ml:
-        Filled water volume and the total internal capacity of the pressure
-        vessel in millilitres.
-    nozzle_diameter_mm, body_diameter_mm:
-        Diameter of the nozzle throat and the main body diameter in millimetres.
-    launch_angle_deg:
-        Elevation angle of the launch guide relative to the horizon.
-    initial_air_pressure_psi:
-        Gauge pressure of the compressed air measured in pounds per square
-        inch.  The conversion accounts for atmospheric pressure to yield the
-        absolute pressure required by the thermodynamic model.
-    discharge_coefficient:
-        Empirical discharge coefficient for the nozzle.
-    drag_coefficient:
-        Aerodynamic drag coefficient referenced to the frontal area defined by
-        ``body_diameter_mm``.
-    air_temperature_c:
-        Launch-day air temperature in degrees Celsius.
-    time_step:
-        Integration time step for :func:`simulate_flight`.
-    max_time:
-        Maximum simulation duration; the integrator halts early when the rocket
-        returns to the ground.
-    air_density:
-        Free-stream air density used by the drag model.
-    gravity:
-        Local gravitational acceleration.
-    """
-
-    dry_mass = (nose_mass_g + structure_mass_g) / 1000.0
-    water_volume = water_volume_ml / 1_000_000.0
-    bottle_volume = bottle_volume_ml / 1_000_000.0
-    nozzle_diameter = nozzle_diameter_mm / 1000.0
-    body_diameter = body_diameter_mm / 1000.0
-    cross_sectional_area = math.pi * (body_diameter * 0.5) ** 2
-
-    air_temperature_k = air_temperature_c + 273.15
-    initial_air_pressure = P_ATM + initial_air_pressure_psi * PSI_TO_PA
-
-    return RocketParameters(
-        dry_mass=dry_mass,
-        water_volume=water_volume,
-        bottle_volume=bottle_volume,
-        nozzle_diameter=nozzle_diameter,
-        discharge_coefficient=discharge_coefficient,
-        drag_coefficient=drag_coefficient,
-        cross_sectional_area=cross_sectional_area,
-        initial_air_pressure=initial_air_pressure,
-        air_temperature=air_temperature_k,
-        launch_angle_deg=launch_angle_deg,
-        time_step=time_step,
-        max_time=max_time,
-        air_density=air_density,
-        gravity=gravity,
-    )
-
-
-if __name__ == "__main__":
-    launch_conditions = LaunchConditions(
-        location="Republic of Korea",
-        date_time=datetime(2025, 9, 5, 16, 0, 0),
-        temperature_c=29.0,
-        wind_speed_m_per_s=0.0,
-    )
-
-    ambient_air_density = estimate_air_density(
-        launch_conditions.temperature_c, pressure_pa=launch_conditions.ambient_pressure_pa
-    )
-
-    # Launch scenario supplied by the build notes in the prompt.
-    scenario_parameters = build_parameters_from_measurements(
-        nose_mass_g=60.0,
-        structure_mass_g=50.0,  # Assumed dry mass of bottle, fins, and hardware
-        water_volume_ml=385.0,
-        bottle_volume_ml=550.0,
-        nozzle_diameter_mm=22.0,
-        body_diameter_mm=65.0,
-        launch_angle_deg=45.0,
-        initial_air_pressure_psi=40.0,
-        discharge_coefficient=0.92,
-        drag_coefficient=0.5,
-        air_temperature_c=launch_conditions.temperature_c,
-        air_density=ambient_air_density,
-    )
-
-    result = simulate_flight(scenario_parameters)
-    range_estimate = result["range"][0]
-    actual_range_m = 89.0
-    range_error = range_estimate - actual_range_m
-    percent_error = abs(range_error) / actual_range_m * 100.0
-    print("Scenario: 60 g nose weight, 385 mL water, 45° launch, 40 psi gauge air")
-    print(
-        "Launch conditions: {loc}, {dt}, temperature {temp:.1f}°C, wind {wind:.1f} m/s".format(
-            loc=launch_conditions.location,
-            dt=launch_conditions.date_time.strftime("%Y-%m-%d %A %H:%M KST"),
-            temp=launch_conditions.temperature_c,
-            wind=launch_conditions.wind_speed_m_per_s,
-        )
-    )
-    print(f"Ambient air density estimate: {ambient_air_density:.3f} kg/m³")
-    print(f"Predicted horizontal range: {range_estimate:.2f} m")
-    print(f"Flight time: {result['time'][-1]:.2f} s")
-    print(f"Actual horizontal range: {actual_range_m:.2f} m")
-    print(f"Range error: {range_error:+.2f} m")
-    print(f"Percent error: {percent_error:.2f}%")
