@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List
 
 
@@ -18,6 +19,24 @@ GAMMA_AIR = 1.4
 RHO_WATER = 1000.0  # kg/m^3
 P_ATM = 101_325.0  # Pa
 PSI_TO_PA = 6_894.75729  # Exact conversion for lbf/in^2 to Pa
+
+
+@dataclass
+class LaunchConditions:
+    """Metadata describing the environment of a particular launch."""
+
+    location: str
+    date_time: datetime
+    temperature_c: float
+    ambient_pressure_pa: float = P_ATM
+    wind_speed_m_per_s: float = 0.0
+
+
+def estimate_air_density(temperature_c: float, *, pressure_pa: float = P_ATM) -> float:
+    """Estimate air density from temperature and pressure assuming dry air."""
+
+    temperature_k = temperature_c + 273.15
+    return pressure_pa / (R_AIR * temperature_k)
 
 
 @dataclass
@@ -354,6 +373,17 @@ def build_parameters_from_measurements(
 
 
 if __name__ == "__main__":
+    launch_conditions = LaunchConditions(
+        location="Republic of Korea",
+        date_time=datetime(2025, 9, 5, 16, 0, 0),
+        temperature_c=29.0,
+        wind_speed_m_per_s=0.0,
+    )
+
+    ambient_air_density = estimate_air_density(
+        launch_conditions.temperature_c, pressure_pa=launch_conditions.ambient_pressure_pa
+    )
+
     # Launch scenario supplied by the build notes in the prompt.
     scenario_parameters = build_parameters_from_measurements(
         nose_mass_g=60.0,
@@ -366,8 +396,8 @@ if __name__ == "__main__":
         initial_air_pressure_psi=40.0,
         discharge_coefficient=0.92,
         drag_coefficient=0.5,
-        air_temperature_c=25.0,
-        air_density=1.18,
+        air_temperature_c=launch_conditions.temperature_c,
+        air_density=ambient_air_density,
     )
 
     result = simulate_flight(scenario_parameters)
@@ -376,6 +406,15 @@ if __name__ == "__main__":
     range_error = range_estimate - actual_range_m
     percent_error = abs(range_error) / actual_range_m * 100.0
     print("Scenario: 60 g nose weight, 385 mL water, 45° launch, 40 psi gauge air")
+    print(
+        "Launch conditions: {loc}, {dt}, temperature {temp:.1f}°C, wind {wind:.1f} m/s".format(
+            loc=launch_conditions.location,
+            dt=launch_conditions.date_time.strftime("%Y-%m-%d %A %H:%M KST"),
+            temp=launch_conditions.temperature_c,
+            wind=launch_conditions.wind_speed_m_per_s,
+        )
+    )
+    print(f"Ambient air density estimate: {ambient_air_density:.3f} kg/m³")
     print(f"Predicted horizontal range: {range_estimate:.2f} m")
     print(f"Flight time: {result['time'][-1]:.2f} s")
     print(f"Actual horizontal range: {actual_range_m:.2f} m")
