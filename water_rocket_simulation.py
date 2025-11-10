@@ -8,6 +8,31 @@ ballistic motion with aerodynamic drag.  In addition to the core solver, the
 module exposes helper utilities for parameter conversion, calibration, and
 sensitivity analysis tailored to the scenario described in the prompt.
 """
+
+# 사용 변수·상수·단위 정리 -----------------------------------------------------
+# dry_mass [kg]                : 로켓의 건조 질량 (사용자가 측정한 60 g → 0.06 kg)
+# water_volume [m^3]           : 병에 채운 물의 체적
+# bottle_volume [m^3]          : 병 내부 총 체적
+# nozzle_diameter [m]          : 분사 노즐 지름 (20 mm)
+# discharge_coefficient [-]    : 유량 계수 (노즐 형상에 따라 불확실)  # TODO: uncertain
+# drag_coefficient [-]         : 공력 항력 계수 (외형에 따라 불확실)  # TODO: uncertain
+# cross_sectional_area [m^2]   : 로켓 정면적
+# initial_air_pressure [Pa]    : 발사 직전 병 내부 공기 압력
+# air_temperature [K]          : 공기 온도 (절대온도)
+# launch_angle_deg [deg]       : 발사각
+# time_step [s]                : 수치 적분 시간 간격
+# max_time [s]                 : 시뮬레이션 최대 시간
+# air_density [kg/m^3]         : 주변 공기 밀도 (기상 조건으로부터 계산)
+# gravity [m/s^2]              : 중력 가속도 (9.80665 m/s^2)
+# polytropic_exponent [-]      : 물 분사 구간의 다원자 지수 (비정상 추진 모델)  # TODO: uncertain
+#
+# 파생 상수 및 단위 --------------------------------------------------------------
+# R_AIR [J/(kg·K)]             : 건조 공기의 기체 상수
+# GAMMA_AIR [-]                : 공기의 비열비 (질식/비질식 판정에 사용)
+# RHO_WATER [kg/m^3]           : 물의 밀도
+# P_ATM [Pa]                   : 대기압 기준값
+# PSI_TO_PA [Pa/psi]           : psi → Pa 환산 계수
+# ------------------------------------------------------------------------------
 from __future__ import annotations
 
 import math
@@ -89,7 +114,9 @@ def nozzle_water_flow(
         raise ValueError("Fluid density must be positive for nozzle flow calculations.")
 
     delta_p = pressure_pa - ambient_pressure_pa
+    # Bernoulli 방정식 (에너지 보존)으로부터 출구 속도 v = sqrt(2 Δp / ρ)를 계산.
     exit_velocity = math.sqrt(2.0 * delta_p / fluid_density)
+    # 질량 보존식 ṁ = C_d ρ A v 로 순간 유량을 산출.
     mass_flow_rate = discharge_coefficient * fluid_density * nozzle_area * exit_velocity
 
     # Unit sanity check: [kg/s] = [kg/m^3] * [m^2] * [m/s]
@@ -120,6 +147,7 @@ def update_tank_pressure_water(
     if polytropic_exponent <= 0.0:
         raise ValueError("Polytropic exponent must be positive.")
 
+    # 비정상(폴리트로픽) 과정: p V^n = const → p = C / V^n.
     pressure = polytropic_constant / (air_volume ** polytropic_exponent)
     if pressure < 0.0 or not math.isfinite(pressure):
         raise ArithmeticError("Computed an invalid reservoir pressure during water phase.")
@@ -146,7 +174,7 @@ def nozzle_air_flow(
     pressure_ratio = ambient_pressure_pa / pressure_pa
 
     if pressure_ratio <= critical_ratio:
-        # Choked flow (Mach 1 at the nozzle throat).
+        # 질식(Choked) 조건: 노즐 목에서 마하 1, 등엔트로피 에너지 방정식 사용.
         exit_pressure = pressure_pa * critical_ratio
         exit_temperature = reservoir_temperature_k * (2.0 / (gamma + 1.0))
         mass_flow_rate = (
@@ -158,7 +186,7 @@ def nozzle_air_flow(
         )
         exit_velocity = math.sqrt(gamma * R_AIR * exit_temperature)
     else:
-        # Subsonic (unchoked) regime.
+        # 비질식(유량 제한 없음) 조건: 등엔트로피 관계와 에너지 방정식으로 출구 상태 결정.
         exit_pressure = ambient_pressure_pa
         pressure_term = pressure_ratio ** ((gamma - 1.0) / gamma)
         energy_term = max(0.0, 1.0 - pressure_term)
@@ -344,6 +372,7 @@ def simulate_flight(
             drag_x = 0.0
             drag_y = 0.0
             if speed > 1e-6:
+                # 항력: F_d = 0.5 ρ C_d A v^2 (뉴턴 제2법칙 적용 시 감쇠력).
                 drag_magnitude = (
                     0.5
                     * params.air_density
@@ -357,6 +386,7 @@ def simulate_flight(
 
             gravity_force = -total_mass * params.gravity
 
+            # 뉴턴 제2법칙: a = ΣF / m (추력, 항력, 중력 합력).
             ax = (thrust * thrust_dir_x + drag_x) / total_mass
             ay = (thrust * thrust_dir_y + drag_y + gravity_force) / total_mass
 
@@ -465,14 +495,14 @@ def build_parameters_from_measurements(
     body_diameter_mm: float,
     launch_angle_deg: float,
     initial_air_pressure_psi: float,
-    discharge_coefficient: float = 0.92,
-    drag_coefficient: float = 0.5,
+    discharge_coefficient: float = 0.92,  # TODO: uncertain
+    drag_coefficient: float = 0.5,  # TODO: uncertain
     air_temperature_c: float = 25.0,
     time_step: float = 5e-4,
     max_time: float = 30.0,
     air_density: float = 1.2,
     gravity: float = 9.80665,
-    polytropic_exponent: float = 1.2,
+    polytropic_exponent: float = 1.2,  # TODO: uncertain
 ) -> RocketParameters:
     """Convert practical build measurements to :class:`RocketParameters`."""
 
